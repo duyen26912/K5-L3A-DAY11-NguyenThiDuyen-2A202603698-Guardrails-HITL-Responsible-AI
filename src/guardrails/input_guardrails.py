@@ -11,6 +11,7 @@ Status convention (không dùng True/False mơ hồ):
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Literal
 
 from google.genai import types
@@ -42,56 +43,86 @@ InputStatus = Literal["ALLOW", "BLOCK"]
 # Regex is one signal, not the whole security boundary.
 # ============================================================
 
+MAX_INPUT_CHARS = 3000  # input quá dài -> chặn (chống nhồi prompt / tốn token)
+
+# Ký tự vô hình hay bị chèn để né regex (zero-width space, soft hyphen, BOM, ...)
+_INVISIBLE = dict.fromkeys(
+    map(ord, "\u200b\u200c\u200d\u2060\ufeff\u00ad\u180e"), None
+)
+
+
+def normalize_text(text: str) -> str:
+    """NFKC + bỏ ký tự vô hình + gộp khoảng trắng."""
+    t = unicodedata.normalize("NFKC", text or "").translate(_INVISIBLE)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def fold_vietnamese(text: str) -> str:
+    """Bỏ dấu tiếng Việt: 'Bỏ qua mật khẩu' -> 'bo qua mat khau'."""
+    t = unicodedata.normalize("NFD", text.lower()).replace("đ", "d")
+    return "".join(c for c in t if unicodedata.category(c) != "Mn")
+
+
+INJECTION_PATTERNS = [
+    # 1. Ghi đè chỉ dẫn
+    r"\b(ignore|disregard|forget|override)\s+(all\s+)?(the\s+|your\s+|any\s+)?"
+    r"(previous|above|prior|earlier|system|original)?\s*(instructions?|rules?|prompts?|guidelines?)",
+    # 2. Đổi vai
+    r"\byou\s+are\s+now\b",
+    r"\bpretend\s+(you\s+are|to\s+be)\b",
+    r"\bact\s+as\s+(a\s+|an\s+)?(unrestricted|unfiltered|uncensored|jailbroken|evil)",
+    r"\b(do\s+anything\s+now|developer\s+mode|jailbreak)",
+    # 3. Moi system prompt
+    r"\bsystem\s+prompt\b",
+    r"\breveal\s+(your|the)\s+(instructions?|prompt|rules|config)",
+    r"\b(translate|encode|repeat|print|dump|summari[sz]e)\s+(all\s+)?(your|the)\s+"
+    r"(instructions?|prompt|rules|config(uration)?)",
+    # 4. Moi secret (kể cả kiểu 'điền vào chỗ trống')
+    r"\b(reveal|show|give|tell|share|print|list|confirm|fill\s+in|what\s+is)\b.{0,60}"
+    r"\b(admin\s+password|api[\s_-]*key|credentials?|database\s+host|db\s+host|internal\s+note)",
+    # 5. Tiếng Việt (so trên bản đã bỏ dấu)
+    r"\bbo\s+qua\s+(moi|tat\s+ca|cac|nhung)?\s*(huong\s+dan|chi\s+dan|lenh|quy\s+tac)",
+    r"\b(tiet\s+lo|cho\s+(toi\s+)?biet|dua\s+(toi|cho\s+toi))\b.{0,40}"
+    r"\b(mat\s+khau|api\s*key|system\s+prompt|thong\s+tin\s+noi\s+bo)",
+    r"\bgia\s+vo\s+(ban\s+)?la\b",
+]
+_INJECTION_RE = [re.compile(p, re.IGNORECASE) for p in INJECTION_PATTERNS]
+
+
 def detect_injection(user_input: str) -> InputStatus:
     """Detect prompt injection patterns in user input.
-
-    Args:
-        user_input: The user's message
 
     Returns:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
-    INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
-    ]
-
-    for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
+    norm = normalize_text(user_input)
+    variants = (norm, fold_vietnamese(norm))
+    for rx in _INJECTION_RE:
+        if any(rx.search(v) for v in variants):
             return "BLOCK"
     return "ALLOW"
 
 
-# ============================================================
-# Implement topic_filter()
-#
-# Check if user_input belongs to allowed topics.
-# The VinBank agent should only answer about: banking, account,
-# transaction, loan, interest rate, savings, credit card.
-#
-# Return ``"BLOCK"`` if input should be blocked (off-topic / blocked topic).
-# Return ``"ALLOW"`` if banking-related and OK.
-# ============================================================
+def _has_term(text: str, term: str) -> bool:
+    # \b ở đầu: 'kill' không khớp 'skill'; không \b ở cuối để 'accounts' vẫn khớp 'account'
+    return re.search(r"\b" + re.escape(term), text) is not None
+
 
 def topic_filter(user_input: str) -> InputStatus:
     """Decide whether the input is on-topic for VinBank.
-
-    Args:
-        user_input: The user's message
 
     Returns:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
-    input_lower = user_input.lower()
-
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
-
-    pass  # Replace with your implementation
+    text = fold_vietnamese(normalize_text(user_input))
+    if not text:
+        return "BLOCK"
+    if any(_has_term(text, t) for t in BLOCKED_TOPICS):
+        return "BLOCK"
+    if not any(_has_term(text, t) for t in ALLOWED_TOPICS):
+        return "BLOCK"
+    return "ALLOW"
 
 
 # ============================================================
@@ -144,14 +175,26 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
+        if len(text) > MAX_INPUT_CHARS:
+            self.blocked_count += 1
+            return self._block_response(
+                "Your message is too long. Please ask a shorter VinBank banking question."
+            )
 
-        pass  # Replace with your implementation
+        if detect_injection(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "I cannot process that request. I can only help with VinBank banking questions."
+            )
+
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "I'm a VinBank assistant and can only help with banking-related questions "
+                "(accounts, transfers, savings, loans, credit cards)."
+            )
+
+        return None
 
 
 # ============================================================
