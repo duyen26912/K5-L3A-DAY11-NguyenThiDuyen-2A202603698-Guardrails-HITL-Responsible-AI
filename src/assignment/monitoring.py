@@ -1,5 +1,5 @@
 """
-Assignment 11 — Monitoring & Alerts starter (TODO).
+Assignment 11 — Monitoring & Alerts.
 
 Tracks block rate, rate-limit hits, judge fail rate.
 Fires alerts when thresholds are exceeded.
@@ -41,17 +41,59 @@ class MonitoringAlert:
     judge_checks: int = 0
     judge_fails: int = 0
 
+    def record(self, *, blocked: bool, layer: str | None = None, judge_failed: bool | None = None):
+        """Cập nhật bộ đếm sau MỖI request (pipeline gọi hàm này)."""
+        self.total_requests += 1
+        if blocked:
+            self.blocked_requests += 1
+        if layer == "rate_limiter":
+            self.rate_limit_hits += 1
+        if judge_failed is not None:
+            self.judge_checks += 1
+            if judge_failed:
+                self.judge_fails += 1
+
     def check_metrics(self) -> list[Alert]:
-        """TODO: compute rates, append Alert objects when thresholds exceeded."""
-        raise NotImplementedError("Implement MonitoringAlert.check_metrics")
+        """Tính lại các tỉ lệ và sinh Alert cho chỉ số vượt ngưỡng.
+
+        Danh sách alert được tính lại từ đầu mỗi lần gọi (không cộng dồn),
+        nên gọi nhiều lần cũng không bị trùng alert.
+        """
+        snap = self.snapshot()
+        rules = [
+            # (tên chỉ số, giá trị hiện tại, ngưỡng, có dữ liệu không, thông điệp)
+            (
+                "block_rate", snap["block_rate"], self.block_rate_threshold,
+                self.total_requests > 0,
+                "Tỉ lệ chặn vượt ngưỡng: có thể đang bị tấn công hàng loạt, "
+                "hoặc filter đang chặn nhầm người dùng thật.",
+            ),
+            (
+                "rate_limit_hits", self.rate_limit_hits, self.rate_limit_hit_threshold,
+                True,
+                "Nhiều request bị rate limit: nghi spam / tấn công tốn chi phí.",
+            ),
+            (
+                "judge_fail_rate", snap["judge_fail_rate"], self.judge_fail_rate_threshold,
+                self.judge_checks > 0,
+                "LLM judge đánh UNSAFE nhiều: cần xem lại output của model.",
+            ),
+        ]
+        self.alerts = [
+            Alert(metric=name, value=round(value, 3), threshold=threshold, message=msg)
+            for name, value, threshold, has_data, msg in rules
+            if has_data and value >= threshold and value > 0
+        ]
+        return self.alerts
 
     def export_json(self, filepath: str | None = None):
-        """TODO: write metrics + alerts to JSON under repo-root ``outputs/`` by default.
-        Use ``filepath or default_metrics_path()`` so running from ``src/`` does not
-        create ``src/outputs/``.
-        """
-        _ = filepath or default_metrics_path()
-        raise NotImplementedError("Implement MonitoringAlert.export_json")
+        """Ghi metrics + alerts ra <repo>/outputs/metrics.json (mặc định)."""
+        self.check_metrics()
+        path = Path(filepath or default_metrics_path())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(self.snapshot(), f, ensure_ascii=False, indent=2)
+        return str(path)
 
     def snapshot(self) -> dict:
         block_rate = (
